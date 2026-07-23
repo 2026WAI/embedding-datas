@@ -5,9 +5,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
+
+try:
+    from pygments import highlight
+    from pygments.formatters import TerminalFormatter
+    from pygments.lexers import TextLexer, get_lexer_by_name
+    from pygments.util import ClassNotFound
+except ImportError:  # pragma: no cover - requirements 설치 전에도 검색은 가능해야 한다.
+    highlight = None
 
 from rag_store import (
     DEFAULT_DB_PATH,
@@ -18,6 +28,14 @@ from rag_store import (
     ensure_searchable,
     search,
 )
+
+
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_CYAN = "\033[36m"
+ANSI_GREEN = "\033[32m"
+FENCED_CODE_START = re.compile(r"^\s*```(?P<language>[A-Za-z0-9_+.-]*)\s*$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", help="예: cpu, cuda, cuda:0")
     parser.add_argument("--query", help="한 번만 검색하고 종료")
     parser.add_argument("--json", action="store_true", help="결과를 JSON으로 출력")
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="색상 출력 방식 (기본: auto)",
+    )
     parser.add_argument("--max-text-chars", type=int, default=1000, help="본문 표시 길이. 0이면 전체")
     return parser.parse_args()
 
@@ -51,24 +75,97 @@ def _preview(text: str, maximum: int) -> str:
     return text if maximum == 0 or len(text) <= maximum else text[:maximum].rstrip() + "\n… (생략됨)"
 
 
-def print_results(results: list[dict[str, Any]], maximum: int, as_json: bool) -> None:
+def _color_enabled(mode: str) -> bool:
+    """색상 출력 여부를 결정한다."""
+    return mode == "always" or (mode == "auto" and sys.stdout.isatty())
+
+
+def _styled(text: str, *codes: str, enabled: bool) -> str:
+    """색상 사용이 허용될 때만 ANSI 스타일을 적용한다."""
+    return f"{''.join(codes)}{text}{ANSI_RESET}" if enabled else text
+
+
+def _rule(label: str, character: str, enabled: bool) -> str:
+    """결과 영역을 구분하는 읽기 쉬운 수평선 생성."""
+    plain = f" {label} "
+    line = f"{character * 12}{plain}{character * 12}"
+    return _styled(line, ANSI_DIM, enabled=enabled)
+
+
+def _highlight_code_blocks(text: str, enabled: bool) -> str:
+    """Markdown fenced code block만 Pygments로 터미널 하이라이팅한다."""
+    if not enabled or highlight is None:
+        return text
+
+    rendered: list[str] = []
+    code_lines: list[str] = []
+    language: str | None = None
+
+    def flush_code() -> None:
+        nonlocal code_lines
+        if not code_lines:
+            return
+        code = "".join(code_lines)
+        try:
+            lexer = get_lexer_by_name(language) if language else TextLexer()
+        except ClassNotFound:
+            lexer = TextLexer()
+        rendered.append(highlight(code, lexer, TerminalFormatter(bg="dark")).rstrip("\n"))
+        code_lines = []
+
+    for line in text.splitlines(keepends=True):
+        if language is None:
+            match = FENCED_CODE_START.match(line.rstrip("\n"))
+            if match:
+                language = match.group("language")
+                rendered.append(_styled(line.rstrip("\n"), ANSI_DIM, enabled=True))
+            else:
+                rendered.append(line.rstrip("\n"))
+        elif line.strip() == "```":
+            flush_code()
+            rendered.append(_styled(line.rstrip("\n"), ANSI_DIM, enabled=True))
+            language = None
+        else:
+            code_lines.append(line)
+
+    if language is not None:
+        flush_code()
+    return "\n".join(rendered)
+
+
+def print_results(
+    results: list[dict[str, Any]],
+    maximum: int,
+    as_json: bool,
+    query: str | None = None,
+    color: str = "auto",
+) -> None:
     """검색 결과의 일반 텍스트 또는 JSON 출력
 
     Args:
         results: rag_store.search가 반환한 결과 목록
         maximum: 일반 텍스트 출력의 최대 본문 문자 수
         as_json: JSON 배열 전체 출력 여부
+        query: 일반 텍스트 출력에 표시할 검색 질의
+        color: 색상 출력 방식
     """
     if as_json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return
+    use_color = _color_enabled(color)
+    if query is not None:
+        print(_rule("검색 질의", "=", use_color))
+        print(_styled(query, ANSI_BOLD, ANSI_CYAN, enabled=use_color))
+        print(_rule("검색 결과", "=", use_color))
     if not results:
         print("검색 결과가 없습니다.")
         return
     for rank, result in enumerate(results, 1):
         metadata = result["metadata"]
-        print(f"\n[{rank}] {result['id']}  similarity={result['similarity']:.4f}")
-        print(f"제목: {metadata.get('title') or '(제목 없음)'}")
+        print()
+        print(_rule(f"{rank}위  similarity={result['similarity']:.4f}", "-", use_color))
+        print(_styled(result["id"], ANSI_BOLD, ANSI_GREEN, enabled=use_color))
+        print(f"제목: {_styled(str(metadata.get('title') or '(제목 없음)'), ANSI_BOLD, enabled=use_color)}")
         print(
             f"출처: {metadata.get('source') or '-'} / item_id={metadata.get('item_id') or '-'} "
             f"/ type={metadata.get('chunk_type') or '-'}"
@@ -78,8 +175,9 @@ def print_results(results: list[dict[str, Any]], maximum: int, as_json: bool) ->
         if metadata.get("published_date"):
             print(f"발행일: {metadata['published_date']}")
         if metadata.get("detail_url"):
-            print(f"원문: {metadata['detail_url']}")
-        print("본문:\n" + _preview(result["text"], maximum))
+            print(f"원문: {_styled(str(metadata['detail_url']), ANSI_CYAN, enabled=use_color)}")
+        print(_rule("본문", "-", use_color))
+        print(_highlight_code_blocks(_preview(result["text"], maximum), use_color))
 
 
 def run_query(
@@ -113,7 +211,13 @@ def main() -> None:
         ensure_searchable(connection, args.model_id)
         embedder = LocalEmbedder(args.model_dir, args.device)
         if args.query is not None:
-            print_results(run_query(embedder, connection, args.query, args.top_k), args.max_text_chars, args.json)
+            print_results(
+                run_query(embedder, connection, args.query, args.top_k),
+                args.max_text_chars,
+                args.json,
+                query=args.query,
+                color=args.color,
+            )
             return
         print("로컬 검색을 시작합니다. 종료: :q, quit, exit")
         while True:
@@ -125,7 +229,13 @@ def main() -> None:
             if query.lower() in {":q", "quit", "exit"}:
                 break
             if query:
-                print_results(run_query(embedder, connection, query, args.top_k), args.max_text_chars, args.json)
+                print_results(
+                    run_query(embedder, connection, query, args.top_k),
+                    args.max_text_chars,
+                    args.json,
+                    query=query,
+                    color=args.color,
+                )
     finally:
         connection.close()
 
