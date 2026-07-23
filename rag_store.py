@@ -245,7 +245,7 @@ class LocalEmbedder:
         if device:
             kwargs["device"] = device
         self.model = SentenceTransformer(str(model_dir), **kwargs)
-        if self.model.get_sentence_embedding_dimension() != EMBEDDING_DIMENSION:
+        if self.model.get_embedding_dimension() != EMBEDDING_DIMENSION:
             raise RuntimeError("예상한 1024차원 BGE-M3 모델이 아닙니다.")
 
     def encode(self, texts: Sequence[str], batch_size: int) -> Any:
@@ -260,7 +260,7 @@ class LocalEmbedder:
         """
         return self.model.encode(
             list(texts), batch_size=batch_size, convert_to_numpy=True,
-            normalize_embeddings=True, show_progress_bar=len(texts) > 1,
+            normalize_embeddings=True, show_progress_bar=False,
         ).astype("float32", copy=False)
 
 
@@ -302,6 +302,13 @@ def synchronize(
     }
     removed = [(chunk_id, existing[chunk_id][0]) for chunk_id in existing.keys() - catalog.keys()]
     changed = [chunk for chunk in catalog.values() if chunk.id not in existing or existing[chunk.id][1] != chunk.content_hash]
+    created = sum(chunk.id not in existing for chunk in changed)
+    updated = len(changed) - created
+    unchanged = len(catalog) - len(changed)
+    print(
+        f"변경사항: 추가 {created:,}, 갱신 {updated:,}, 삭제 {len(removed):,}, "
+        f"유지 {unchanged:,} (임베딩 대상 {len(changed):,}개)"
+    )
     embedder = LocalEmbedder(model_dir, device) if changed else None
 
     # 중간 실패 시 기존 검색 인덱스 보존을 위한 모든 변경의 단일 트랜잭션 처리
@@ -309,22 +316,28 @@ def synchronize(
         for _, rowid in removed:
             connection.execute("DELETE FROM vec_chunks WHERE rowid = ?", (rowid,))
             connection.execute("DELETE FROM chunks WHERE rowid = ?", (rowid,))
-        for group in _batches(changed, batch_size):
-            assert embedder is not None
-            embeddings = embedder.encode([chunk.text for chunk in group], batch_size)
-            for chunk, embedding in zip(group, embeddings, strict=True):
-                if chunk.id in existing:
-                    rowid = existing[chunk.id][0]
-                    connection.execute("DELETE FROM vec_chunks WHERE rowid = ?", (rowid,))
-                    connection.execute(UPDATE_SQL, (*_values(chunk), rowid))
-                else:
-                    rowid = int(connection.execute(INSERT_SQL, _values(chunk)).lastrowid)
-                connection.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)", (rowid, embedding))
+        if changed:
+            from tqdm import tqdm
+
+            with tqdm(
+                total=len(changed), desc="임베딩 진행", unit="청크", dynamic_ncols=True
+            ) as progress:
+                for group in _batches(changed, batch_size):
+                    assert embedder is not None
+                    embeddings = embedder.encode([chunk.text for chunk in group], batch_size)
+                    for chunk, embedding in zip(group, embeddings, strict=True):
+                        if chunk.id in existing:
+                            rowid = existing[chunk.id][0]
+                            connection.execute("DELETE FROM vec_chunks WHERE rowid = ?", (rowid,))
+                            connection.execute(UPDATE_SQL, (*_values(chunk), rowid))
+                        else:
+                            rowid = int(connection.execute(INSERT_SQL, _values(chunk)).lastrowid)
+                        connection.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)", (rowid, embedding))
+                    progress.update(len(group))
         _set_config(connection, model_id)
     return {
         "total": len(catalog), "created": sum(chunk.id not in existing for chunk in changed),
-        "updated": sum(chunk.id in existing for chunk in changed), "deleted": len(removed),
-        "unchanged": len(catalog) - len(changed),
+        "updated": updated, "deleted": len(removed), "unchanged": unchanged,
     }
 
 

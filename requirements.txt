@@ -3,3 +3,5 @@
 sentence-transformers>=3.0.0
 huggingface-hub>=0.24.0
 sqlite-vec>=0.1.6
+tqdm>=4.66.0
+PyYAML>=6.0.2
