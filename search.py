@@ -23,7 +23,7 @@ from rag_store import (
     DEFAULT_DB_PATH,
     DEFAULT_MODEL_DIR,
     MODEL_ID,
-    LocalEmbedder,
+    HybridEmbedder,
     connect_database,
     ensure_searchable,
     search,
@@ -44,12 +44,18 @@ def parse_args() -> argparse.Namespace:
     Returns:
         DB, 모델, 검색 개수, 출력 형식 설정을 포함한 인자 객체
     """
-    parser = argparse.ArgumentParser(description="BGE-M3 + sqlite-vec 로컬 청크 검색")
+    parser = argparse.ArgumentParser(description="BGE-M3 dense/sparse hybrid 로컬 청크 검색")
     parser.add_argument("--db-path", type=Path, default=DEFAULT_DB_PATH, help="SQLite DB 파일")
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="내려받은 BGE-M3 경로")
     parser.add_argument("--model-id", default=MODEL_ID, help="DB와 비교할 모델 식별자")
     parser.add_argument("-k", "--top-k", type=int, default=5, help="반환할 청크 수")
     parser.add_argument("--device", help="예: cpu, cuda, cuda:0")
+    parser.add_argument(
+        "--mode",
+        choices=("hybrid", "dense", "sparse"),
+        default="hybrid",
+        help="검색 방식 (기본: hybrid; dense와 sparse를 RRF로 결합)",
+    )
     parser.add_argument("--query", help="한 번만 검색하고 종료")
     parser.add_argument("--json", action="store_true", help="결과를 JSON으로 출력")
     parser.add_argument(
@@ -163,7 +169,14 @@ def print_results(
     for rank, result in enumerate(results, 1):
         metadata = result["metadata"]
         print()
-        print(_rule(f"{rank}위  similarity={result['similarity']:.4f}", "-", use_color))
+        score = (
+            f"rrf={result['rrf_score']:.4f}"
+            if "rrf_score" in result
+            else f"sparse={result['sparse_score']:.4f}"
+            if "sparse_score" in result and "similarity" not in result
+            else f"similarity={result['similarity']:.4f}"
+        )
+        print(_rule(f"{rank}위  {score}", "-", use_color))
         print(_styled(result["id"], ANSI_BOLD, ANSI_GREEN, enabled=use_color))
         print(f"제목: {_styled(str(metadata.get('title') or '(제목 없음)'), ANSI_BOLD, enabled=use_color)}")
         print(
@@ -181,20 +194,26 @@ def print_results(
 
 
 def run_query(
-    embedder: LocalEmbedder, connection: sqlite3.Connection, query: str, top_k: int
+    embedder: HybridEmbedder,
+    connection: sqlite3.Connection,
+    query: str,
+    top_k: int,
+    mode: str,
 ) -> list[dict[str, Any]]:
-    """질의 임베딩 및 단일 벡터 검색 실행
+    """질의의 dense/sparse 임베딩 생성 및 지정 검색 실행
 
     Args:
         embedder: 로컬 BGE-M3 임베더
         connection: sqlite-vec 로드가 완료된 SQLite 연결
         query: 사용자 입력 검색 질의
         top_k: 반환할 최근접 청크 수
+        mode: dense, sparse 또는 hybrid
 
     Returns:
         유사도 순 정렬 검색 결과 목록
     """
-    return search(connection, embedder.encode([query], 1)[0], top_k)
+    dense_embeddings, sparse_embeddings = embedder.encode([query], 1)
+    return search(connection, dense_embeddings[0], sparse_embeddings[0], top_k, mode)
 
 
 def main() -> None:
@@ -209,10 +228,10 @@ def main() -> None:
     connection = connect_database(args.db_path)
     try:
         ensure_searchable(connection, args.model_id)
-        embedder = LocalEmbedder(args.model_dir, args.device)
+        embedder = HybridEmbedder(args.model_dir, args.device)
         if args.query is not None:
             print_results(
-                run_query(embedder, connection, args.query, args.top_k),
+                run_query(embedder, connection, args.query, args.top_k, args.mode),
                 args.max_text_chars,
                 args.json,
                 query=args.query,
@@ -230,7 +249,7 @@ def main() -> None:
                 break
             if query:
                 print_results(
-                    run_query(embedder, connection, query, args.top_k),
+                    run_query(embedder, connection, query, args.top_k, args.mode),
                     args.max_text_chars,
                     args.json,
                     query=query,

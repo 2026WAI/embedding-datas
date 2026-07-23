@@ -1,4 +1,4 @@
-"""청크 JSONL을 로컬 BGE-M3 및 SQLite/sqlite-vec로 다루는 공통 기능"""
+"""BGE-M3 dense/sparse 임베딩과 SQLite 역색인을 다루는 공통 기능."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any, Iterator, Sequence
 
 MODEL_ID = "BAAI/bge-m3"
 EMBEDDING_DIMENSION = 1024
+STORE_FORMAT = "bge-m3-hybrid-v1"
 DEFAULT_CHUNK_DIR = Path("chunk")
 DEFAULT_DB_PATH = Path("vector_store/rag.sqlite3")
 DEFAULT_MODEL_DIR = Path(".models/bge-m3")
@@ -119,7 +120,7 @@ def connect_database(db_path: Path) -> sqlite3.Connection:
 
 
 def create_schema(connection: sqlite3.Connection) -> None:
-    """청크 메타데이터 및 1024차원 벡터 검색용 스키마 생성
+    """청크, dense 벡터 및 BGE-M3 sparse 역색인 스키마 생성
 
     Args:
         connection: sqlite-vec 로드가 완료된 SQLite 연결
@@ -140,6 +141,13 @@ def create_schema(connection: sqlite3.Connection) -> None:
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
             embedding float[1024] distance_metric=cosine
         );
+        CREATE TABLE IF NOT EXISTS sparse_postings (
+            token_id TEXT NOT NULL,
+            chunk_rowid INTEGER NOT NULL,
+            weight REAL NOT NULL,
+            PRIMARY KEY (token_id, chunk_rowid)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_sparse_postings_chunk ON sparse_postings(chunk_rowid);
         """
     )
 
@@ -154,7 +162,8 @@ def rebuild_schema(connection: sqlite3.Connection) -> None:
         data/ 미접근 및 chunk/ 원본 파일 미수정
     """
     connection.executescript(
-        "DROP TABLE IF EXISTS vec_chunks; DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS store_config;"
+        "DROP TABLE IF EXISTS sparse_postings; DROP TABLE IF EXISTS vec_chunks; "
+        "DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS store_config;"
     )
     create_schema(connection)
 
@@ -172,13 +181,21 @@ def ensure_store_compatible(connection: sqlite3.Connection, model_id: str) -> No
         raise RuntimeError(
             f"DB 모델은 {stored_model}입니다. 현재 모델({model_id})을 쓰려면 sync_embeddings.py --rebuild를 실행하세요."
         )
+    store_format = _config(connection, "store_format")
+    if store_format != STORE_FORMAT and connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]:
+        raise RuntimeError("DB 인덱스 형식이 다릅니다. sync_embeddings.py --rebuild로 새로 만드세요.")
 
 
 def _set_config(connection: sqlite3.Connection, model_id: str) -> None:
     connection.executemany(
         "INSERT INTO store_config(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        {"model_id": model_id, "embedding_dimension": str(EMBEDDING_DIMENSION), "distance_metric": "cosine"}.items(),
+        {
+            "model_id": model_id,
+            "embedding_dimension": str(EMBEDDING_DIMENSION),
+            "distance_metric": "cosine",
+            "store_format": STORE_FORMAT,
+        }.items(),
     )
 
 
@@ -217,8 +234,8 @@ UPDATE chunks SET id=?, text=?, metadata_json=?, source=?, source_directory=?, i
 """
 
 
-class LocalEmbedder:
-    """미리 다운로드한 BGE-M3 기반 정규화 밀집 벡터 생성"""
+class HybridEmbedder:
+    """로컬 BGE-M3에서 dense 벡터와 sparse lexical weight를 함께 생성한다."""
 
     def __init__(self, model_dir: Path, device: str | None = None):
         """로컬 BGE-M3 모델 로드
@@ -236,32 +253,42 @@ class LocalEmbedder:
                 f"로컬 모델이 없습니다: {model_dir}. python download_model.py --model-dir {model_dir}를 먼저 실행하세요."
             )
         try:
-            from sentence_transformers import SentenceTransformer
+            from FlagEmbedding import BGEM3FlagModel
         except ImportError as exc:
             raise RuntimeError(
-                "sentence-transformers가 없습니다. python -m pip install -r requirements.txt를 실행하세요."
+                "FlagEmbedding이 없습니다. python -m pip install -r requirements.txt를 실행하세요."
             ) from exc
-        kwargs: dict[str, Any] = {"local_files_only": True}
-        if device:
-            kwargs["device"] = device
-        self.model = SentenceTransformer(str(model_dir), **kwargs)
-        if self.model.get_embedding_dimension() != EMBEDDING_DIMENSION:
-            raise RuntimeError("예상한 1024차원 BGE-M3 모델이 아닙니다.")
+        self.model = BGEM3FlagModel(
+            str(model_dir),
+            use_fp16=bool(device and device.startswith("cuda")),
+            device=device,
+        )
 
-    def encode(self, texts: Sequence[str], batch_size: int) -> Any:
-        """문자열 목록의 cosine 검색용 float32 정규화 벡터 변환
+    def encode(self, texts: Sequence[str], batch_size: int) -> tuple[Any, list[dict[str, float]]]:
+        """문자열 목록을 dense 벡터와 BGE-M3 sparse token weight로 변환한다.
 
         Args:
             texts: 임베딩할 청크 본문 또는 검색 질의 목록
             batch_size: 한 번의 모델 추론에 사용할 문자열 수
 
         Returns:
-            행마다 하나의 1024차원 벡터가 담긴 NumPy float32 배열
+            행마다 하나의 1024차원 float32 벡터 및 token_id별 가중치 목록
         """
-        return self.model.encode(
-            list(texts), batch_size=batch_size, convert_to_numpy=True,
-            normalize_embeddings=True, show_progress_bar=False,
-        ).astype("float32", copy=False)
+        output = self.model.encode(
+            list(texts),
+            batch_size=batch_size,
+            return_dense=True,
+            return_sparse=True,
+            return_colbert_vecs=False,
+        )
+        dense = output["dense_vecs"].astype("float32", copy=False)
+        sparse = [
+            {str(token_id): float(weight) for token_id, weight in weights.items() if float(weight) > 0.0}
+            for weights in output["lexical_weights"]
+        ]
+        if dense.ndim != 2 or dense.shape[1] != EMBEDDING_DIMENSION:
+            raise RuntimeError("예상한 1024차원 BGE-M3 dense 벡터가 아닙니다.")
+        return dense, sparse
 
 
 def _batches(items: Sequence[Chunk], size: int) -> Iterator[Sequence[Chunk]]:
@@ -309,12 +336,13 @@ def synchronize(
         f"변경사항: 추가 {created:,}, 갱신 {updated:,}, 삭제 {len(removed):,}, "
         f"유지 {unchanged:,} (임베딩 대상 {len(changed):,}개)"
     )
-    embedder = LocalEmbedder(model_dir, device) if changed else None
+    embedder = HybridEmbedder(model_dir, device) if changed else None
 
     # 중간 실패 시 기존 검색 인덱스 보존을 위한 모든 변경의 단일 트랜잭션 처리
     with connection:
         for _, rowid in removed:
             connection.execute("DELETE FROM vec_chunks WHERE rowid = ?", (rowid,))
+            connection.execute("DELETE FROM sparse_postings WHERE chunk_rowid = ?", (rowid,))
             connection.execute("DELETE FROM chunks WHERE rowid = ?", (rowid,))
         if changed:
             from tqdm import tqdm
@@ -324,15 +352,27 @@ def synchronize(
             ) as progress:
                 for group in _batches(changed, batch_size):
                     assert embedder is not None
-                    embeddings = embedder.encode([chunk.text for chunk in group], batch_size)
-                    for chunk, embedding in zip(group, embeddings, strict=True):
+                    dense_embeddings, sparse_embeddings = embedder.encode(
+                        [chunk.text for chunk in group], batch_size
+                    )
+                    for chunk, dense_embedding, sparse_embedding in zip(
+                        group, dense_embeddings, sparse_embeddings, strict=True
+                    ):
                         if chunk.id in existing:
                             rowid = existing[chunk.id][0]
                             connection.execute("DELETE FROM vec_chunks WHERE rowid = ?", (rowid,))
+                            connection.execute("DELETE FROM sparse_postings WHERE chunk_rowid = ?", (rowid,))
                             connection.execute(UPDATE_SQL, (*_values(chunk), rowid))
                         else:
                             rowid = int(connection.execute(INSERT_SQL, _values(chunk)).lastrowid)
-                        connection.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)", (rowid, embedding))
+                        connection.execute(
+                            "INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
+                            (rowid, dense_embedding),
+                        )
+                        connection.executemany(
+                            "INSERT INTO sparse_postings(token_id, chunk_rowid, weight) VALUES (?, ?, ?)",
+                            ((token_id, rowid, weight) for token_id, weight in sparse_embedding.items()),
+                        )
                     progress.update(len(group))
         _set_config(connection, model_id)
     return {
@@ -352,27 +392,26 @@ def ensure_searchable(connection: sqlite3.Connection, model_id: str) -> None:
         RuntimeError: 인덱스 부재, 인덱스 비어 있음 또는 모델 비호환
     """
     names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
-    if not {"chunks", "vec_chunks"}.issubset(names):
+    if not {"chunks", "vec_chunks", "sparse_postings"}.issubset(names):
         raise RuntimeError("검색 인덱스가 없습니다. 먼저 python sync_embeddings.py를 실행하세요.")
     ensure_store_compatible(connection, model_id)
     if connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0:
         raise RuntimeError("검색 가능한 청크가 없습니다. chunk/와 동기화 결과를 확인하세요.")
 
 
-def search(connection: sqlite3.Connection, query_embedding: Any, top_k: int) -> list[dict[str, Any]]:
-    """질의 벡터 근접 청크 및 원본 metadata 반환
+def _result(row: sqlite3.Row, **scores: float | int | None) -> dict[str, Any]:
+    """DB 행과 검색 점수를 공통 결과 객체로 만든다."""
+    result: dict[str, Any] = {
+        "id": row["id"],
+        "text": row["text"],
+        "metadata": json.loads(row["metadata_json"]),
+    }
+    result.update({key: value for key, value in scores.items() if value is not None})
+    return result
 
-    Args:
-        connection: sqlite-vec 로드가 완료된 SQLite 연결
-        query_embedding: 정규화된 1024차원 float32 질의 벡터
-        top_k: 반환할 최근접 청크 수
 
-    Returns:
-        id, text, metadata, cosine distance, similarity를 포함한 결과 목록
-
-    Raises:
-        ValueError: top_k가 1보다 작은 경우
-    """
+def search_dense(connection: sqlite3.Connection, query_embedding: Any, top_k: int) -> list[dict[str, Any]]:
+    """sqlite-vec cosine KNN으로 dense 후보를 검색한다."""
     if top_k < 1:
         raise ValueError("top_k는 1 이상이어야 합니다.")
     rows = connection.execute(
@@ -387,9 +426,109 @@ def search(connection: sqlite3.Connection, query_embedding: Any, top_k: int) -> 
         (query_embedding, top_k),
     ).fetchall()
     return [
-        {
-            "id": row["id"], "text": row["text"], "metadata": json.loads(row["metadata_json"]),
-            "distance": float(row["distance"]), "similarity": 1.0 - float(row["distance"]),
-        }
+        _result(
+            row,
+            distance=float(row["distance"]),
+            similarity=1.0 - float(row["distance"]),
+            dense_score=1.0 - float(row["distance"]),
+        )
         for row in rows
     ]
+
+
+def search_sparse(
+    connection: sqlite3.Connection, query_weights: dict[str, float], top_k: int
+) -> list[dict[str, Any]]:
+    """BGE-M3 lexical weight의 내적으로 SQLite 역색인을 검색한다.
+
+    질의 token_id와 청크 posting을 조인해 `sum(query_weight * document_weight)`를
+    계산한다. 임시 테이블은 연결별로 격리되어 동시 검색 간에 공유되지 않는다.
+    """
+    if top_k < 1:
+        raise ValueError("top_k는 1 이상이어야 합니다.")
+    if not query_weights:
+        return []
+    connection.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS query_sparse_terms "
+        "(token_id TEXT PRIMARY KEY, weight REAL NOT NULL) WITHOUT ROWID"
+    )
+    connection.execute("DELETE FROM query_sparse_terms")
+    connection.executemany(
+        "INSERT INTO query_sparse_terms(token_id, weight) VALUES (?, ?)", query_weights.items()
+    )
+    rows = connection.execute(
+        """
+        WITH sparse_scores AS (
+            SELECT postings.chunk_rowid, SUM(postings.weight * query_terms.weight) AS score
+            FROM query_sparse_terms AS query_terms
+            JOIN sparse_postings AS postings USING (token_id)
+            GROUP BY postings.chunk_rowid
+            ORDER BY score DESC, postings.chunk_rowid ASC
+            LIMIT ?
+        )
+        SELECT chunks.id, chunks.text, chunks.metadata_json, sparse_scores.score
+        FROM sparse_scores JOIN chunks ON chunks.rowid = sparse_scores.chunk_rowid
+        ORDER BY sparse_scores.score DESC, sparse_scores.chunk_rowid ASC
+        """,
+        (top_k,),
+    ).fetchall()
+    return [_result(row, sparse_score=float(row["score"])) for row in rows]
+
+
+def search_hybrid(
+    connection: sqlite3.Connection,
+    query_embedding: Any,
+    query_weights: dict[str, float],
+    top_k: int,
+    rrf_k: int = 60,
+) -> list[dict[str, Any]]:
+    """dense와 sparse 후보를 RRF(Reciprocal Rank Fusion)로 합친다."""
+    if top_k < 1:
+        raise ValueError("top_k는 1 이상이어야 합니다.")
+    candidate_k = max(50, top_k * 5)
+    dense_results = search_dense(connection, query_embedding, candidate_k)
+    sparse_results = search_sparse(connection, query_weights, candidate_k)
+    merged: dict[str, dict[str, Any]] = {}
+    for rank, result in enumerate(dense_results, 1):
+        fused = merged.setdefault(result["id"], dict(result))
+        fused["dense_rank"] = rank
+        fused["rrf_score"] = float(fused.get("rrf_score", 0.0)) + 1.0 / (rrf_k + rank)
+    for rank, result in enumerate(sparse_results, 1):
+        fused = merged.setdefault(result["id"], dict(result))
+        fused["sparse_rank"] = rank
+        fused["sparse_score"] = result["sparse_score"]
+        fused["rrf_score"] = float(fused.get("rrf_score", 0.0)) + 1.0 / (rrf_k + rank)
+    return sorted(
+        merged.values(), key=lambda item: (-float(item["rrf_score"]), str(item["id"]))
+    )[:top_k]
+
+
+def search(
+    connection: sqlite3.Connection,
+    query_embedding: Any,
+    query_weights: dict[str, float],
+    top_k: int,
+    mode: str = "hybrid",
+) -> list[dict[str, Any]]:
+    """지정한 dense, sparse 또는 hybrid 방식으로 청크를 검색한다.
+
+    Args:
+        connection: sqlite-vec 로드가 완료된 SQLite 연결
+        query_embedding: 정규화된 1024차원 float32 질의 벡터
+        query_weights: BGE-M3 sparse lexical weight
+        top_k: 반환할 최근접 청크 수
+        mode: dense, sparse 또는 hybrid
+
+    Returns:
+        id, text, metadata 및 검색 모드별 점수를 포함한 결과 목록
+
+    Raises:
+        ValueError: top_k가 1보다 작은 경우
+    """
+    if mode == "dense":
+        return search_dense(connection, query_embedding, top_k)
+    if mode == "sparse":
+        return search_sparse(connection, query_weights, top_k)
+    if mode == "hybrid":
+        return search_hybrid(connection, query_embedding, query_weights, top_k)
+    raise ValueError("mode는 dense, sparse 또는 hybrid여야 합니다.")

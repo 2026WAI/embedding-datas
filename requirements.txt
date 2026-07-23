@@ -1,6 +1,6 @@
 # 필요하면 이 파일을 설치하기 전 또는 함께 환경에 맞는 PyTorch(CPU/CUDA)를 설치한다.
-# sentence-transformers는 로컬 BGE-M3 실행에 PyTorch를 사용한다.
-sentence-transformers>=3.0.0
+# FlagEmbedding은 BGE-M3의 dense 및 sparse lexical weight를 함께 생성한다.
+FlagEmbedding>=1.3.0
 huggingface-hub>=0.24.0
 sqlite-vec>=0.1.6
 tqdm>=4.66.0

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from rag_store import load_chunks
+from rag_store import load_chunks, search, search_sparse
 from sync_embeddings import resolve_args
 
 
@@ -79,6 +80,51 @@ class EmbeddingConfigTests(unittest.TestCase):
             config.write_text("unknown: value\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "알 수 없는 설정 항목"):
                 resolve_args(self.arguments(config))
+
+
+class SparseInvertedIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.executescript(
+            """
+            CREATE TABLE chunks (id TEXT PRIMARY KEY, text TEXT NOT NULL, metadata_json TEXT NOT NULL);
+            CREATE TABLE sparse_postings (
+                token_id TEXT NOT NULL,
+                chunk_rowid INTEGER NOT NULL,
+                weight REAL NOT NULL,
+                PRIMARY KEY (token_id, chunk_rowid)
+            ) WITHOUT ROWID;
+            """
+        )
+        for chunk_id, text in (("a", "첫 청크"), ("b", "둘째 청크"), ("c", "셋째 청크")):
+            self.connection.execute(
+                "INSERT INTO chunks(id, text, metadata_json) VALUES (?, ?, '{}')", (chunk_id, text)
+            )
+        self.connection.executemany(
+            "INSERT INTO sparse_postings(token_id, chunk_rowid, weight) VALUES (?, ?, ?)",
+            [
+                ("10", 1, 0.2),
+                ("20", 1, 0.8),
+                ("10", 2, 0.9),
+                ("20", 3, 0.9),
+            ],
+        )
+
+    def tearDown(self) -> None:
+        self.connection.close()
+
+    def test_sparse_search_scores_postings_by_lexical_inner_product(self) -> None:
+        results = search_sparse(self.connection, {"10": 0.5, "20": 0.5}, 3)
+
+        self.assertEqual([result["id"] for result in results], ["a", "b", "c"])
+        self.assertAlmostEqual(float(results[0]["sparse_score"]), 0.5)
+        self.assertAlmostEqual(float(results[1]["sparse_score"]), 0.45)
+
+    def test_search_dispatches_sparse_mode(self) -> None:
+        results = search(self.connection, None, {"20": 1.0}, 2, mode="sparse")
+
+        self.assertEqual([result["id"] for result in results], ["c", "a"])
 
 
 if __name__ == "__main__":
