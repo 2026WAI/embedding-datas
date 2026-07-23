@@ -8,3 +8,5 @@ batch_size: 16
 # CPU만 사용할 때는 cpu, NVIDIA GPU는 cuda 또는 cuda:0을 지정합니다.
 # null이면 sentence-transformers가 장치를 자동 선택합니다.
 device: null
+# tqdm은 터미널용 동적 막대, log는 배치마다 줄을 flush해 Kaggle 로그 프리뷰에 적합합니다.
+progress: tqdm

@@ -41,6 +41,8 @@ CPU 대신 Colab GPU에서 전체 임베딩을 만들려면 루트의
 Kaggle에서는 청크가 담긴 Dataset을 Input으로 추가한 뒤 `build_embeddings_kaggle.ipynb`를
 실행하세요. GPU와 Internet을 켜고, 완료 후 Save Version의
 Output 탭에서 `rag.sqlite3`를 내려받을 수 있습니다.
+Kaggle 노트북은 셀 프리뷰에 맞춰 `--progress log`를 사용하므로, 배치마다 새 줄의
+진행률·처리 속도·경과 시간·ETA가 즉시 출력됩니다.
 
 기본 동기화 설정은 `embedding_config.yaml`에 있습니다. `batch_size`, `device`, 모델 및
 경로를 그 파일에서 바꿀 수 있으며, 명령행 옵션을 지정하면 그 값이 우선합니다. 예를 들어

@@ -28,6 +28,7 @@ DEFAULTS: dict[str, Any] = {
     "model_id": MODEL_ID,
     "batch_size": 16,
     "device": None,
+    "progress": "tqdm",
 }
 PATH_SETTINGS = {"chunk_dir", "db_path", "model_dir"}
 
@@ -64,6 +65,10 @@ def load_config(path: Path) -> dict[str, Any]:
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError("device는 문자열 또는 null이어야 합니다.")
             config[key] = value
+        elif key == "progress":
+            if value not in {"tqdm", "log"}:
+                raise ValueError("progress는 tqdm 또는 log여야 합니다.")
+            config[key] = value
         elif not isinstance(value, str) or not value:
             raise ValueError(f"{key}는 비어 있지 않은 문자열이어야 합니다.")
         else:
@@ -85,6 +90,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", help="DB에 기록할 모델 식별자")
     parser.add_argument("--batch-size", type=int, help="BGE-M3 임베딩 배치 크기")
     parser.add_argument("--device", help="예: cpu, cuda, cuda:0. 생략하면 기본 장치 선택")
+    parser.add_argument(
+        "--progress",
+        choices=("tqdm", "log"),
+        help="진행 출력 방식. log는 배치마다 새 줄을 flush해 노트북 로그에 적합",
+    )
     parser.add_argument("--rebuild", action="store_true", help="기존 생성 DB를 비우고 전체 재임베딩")
     return parser.parse_args()
 
@@ -100,7 +110,7 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
         config = {}
 
     for key, default in DEFAULTS.items():
-        command_line_value = getattr(args, key)
+        command_line_value = getattr(args, key, None)
         setattr(args, key, command_line_value if command_line_value is not None else config.get(key, default))
     args.config = config_path
     return args
@@ -125,7 +135,15 @@ def main() -> None:
         if args.rebuild:
             rebuild_schema(connection)
             print("기존 생성 인덱스를 비웠습니다.")
-        result = synchronize(connection, catalog, args.model_id, args.model_dir, args.batch_size, args.device)
+        result = synchronize(
+            connection,
+            catalog,
+            args.model_id,
+            args.model_dir,
+            args.batch_size,
+            args.device,
+            args.progress,
+        )
     finally:
         connection.close()
     print(

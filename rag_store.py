@@ -8,6 +8,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any, Iterator, Sequence
 
 MODEL_ID = "BAAI/bge-m3"
@@ -296,9 +297,17 @@ def _batches(items: Sequence[Chunk], size: int) -> Iterator[Sequence[Chunk]]:
         yield items[start : start + size]
 
 
+def _format_duration(seconds: float) -> str:
+    """진행 로그에 표시할 짧은 경과 시간 문자열을 만든다."""
+    rounded = max(0, round(seconds))
+    minutes, seconds = divmod(rounded, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:d}:{seconds:02d}"
+
+
 def synchronize(
     connection: sqlite3.Connection, catalog: dict[str, Chunk], model_id: str,
-    model_dir: Path, batch_size: int, device: str | None,
+    model_dir: Path, batch_size: int, device: str | None, progress: str = "tqdm",
 ) -> dict[str, int]:
     """현재 JSONL 카탈로그와 생성 DB의 완전 동기화
 
@@ -309,18 +318,22 @@ def synchronize(
         model_dir: 로컬 BGE-M3 모델 디렉터리
         batch_size: 모델 추론 배치 크기
         device: 사용할 PyTorch 장치, 생략 시 라이브러리 기본값 사용
+        progress: tqdm 동적 막대 또는 줄 단위 log 진행 출력 방식
 
     Returns:
         total, created, updated, deleted, unchanged 수를 담은 사전
 
     Raises:
         RuntimeError: 기존 DB의 모델 또는 벡터 차원 비호환
+        ValueError: 알 수 없는 진행 출력 방식
         FileNotFoundError: 변경분 존재 시 로컬 모델 미존재
 
     Note:
         모든 DB 변경의 단일 트랜잭션 처리, 임베딩 도중 실패 시 이전 검색
         인덱스 유지
     """
+    if progress not in {"tqdm", "log"}:
+        raise ValueError("progress는 tqdm 또는 log여야 합니다.")
     create_schema(connection)
     ensure_store_compatible(connection, model_id)
     existing = {
@@ -345,35 +358,53 @@ def synchronize(
             connection.execute("DELETE FROM sparse_postings WHERE chunk_rowid = ?", (rowid,))
             connection.execute("DELETE FROM chunks WHERE rowid = ?", (rowid,))
         if changed:
-            from tqdm import tqdm
-
-            with tqdm(
-                total=len(changed), desc="임베딩 진행", unit="청크", dynamic_ncols=True
-            ) as progress:
-                for group in _batches(changed, batch_size):
-                    assert embedder is not None
-                    dense_embeddings, sparse_embeddings = embedder.encode(
-                        [chunk.text for chunk in group], batch_size
+            def index_group(group: Sequence[Chunk]) -> None:
+                assert embedder is not None
+                dense_embeddings, sparse_embeddings = embedder.encode(
+                    [chunk.text for chunk in group], batch_size
+                )
+                for chunk, dense_embedding, sparse_embedding in zip(
+                    group, dense_embeddings, sparse_embeddings, strict=True
+                ):
+                    if chunk.id in existing:
+                        rowid = existing[chunk.id][0]
+                        connection.execute("DELETE FROM vec_chunks WHERE rowid = ?", (rowid,))
+                        connection.execute("DELETE FROM sparse_postings WHERE chunk_rowid = ?", (rowid,))
+                        connection.execute(UPDATE_SQL, (*_values(chunk), rowid))
+                    else:
+                        rowid = int(connection.execute(INSERT_SQL, _values(chunk)).lastrowid)
+                    connection.execute(
+                        "INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
+                        (rowid, dense_embedding),
                     )
-                    for chunk, dense_embedding, sparse_embedding in zip(
-                        group, dense_embeddings, sparse_embeddings, strict=True
-                    ):
-                        if chunk.id in existing:
-                            rowid = existing[chunk.id][0]
-                            connection.execute("DELETE FROM vec_chunks WHERE rowid = ?", (rowid,))
-                            connection.execute("DELETE FROM sparse_postings WHERE chunk_rowid = ?", (rowid,))
-                            connection.execute(UPDATE_SQL, (*_values(chunk), rowid))
-                        else:
-                            rowid = int(connection.execute(INSERT_SQL, _values(chunk)).lastrowid)
-                        connection.execute(
-                            "INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
-                            (rowid, dense_embedding),
-                        )
-                        connection.executemany(
-                            "INSERT INTO sparse_postings(token_id, chunk_rowid, weight) VALUES (?, ?, ?)",
-                            ((token_id, rowid, weight) for token_id, weight in sparse_embedding.items()),
-                        )
-                    progress.update(len(group))
+                    connection.executemany(
+                        "INSERT INTO sparse_postings(token_id, chunk_rowid, weight) VALUES (?, ?, ?)",
+                        ((token_id, rowid, weight) for token_id, weight in sparse_embedding.items()),
+                    )
+
+            if progress == "tqdm":
+                from tqdm import tqdm
+
+                with tqdm(
+                    total=len(changed), desc="임베딩 진행", unit="청크", dynamic_ncols=True
+                ) as progress_bar:
+                    for group in _batches(changed, batch_size):
+                        index_group(group)
+                        progress_bar.update(len(group))
+            elif progress == "log":
+                started_at, completed = monotonic(), 0
+                for group in _batches(changed, batch_size):
+                    index_group(group)
+                    completed += len(group)
+                    elapsed = monotonic() - started_at
+                    rate = completed / elapsed if elapsed else 0.0
+                    remaining = (len(changed) - completed) / rate if rate else 0.0
+                    print(
+                        f"임베딩 진행: {completed:,}/{len(changed):,} "
+                        f"({completed / len(changed):.1%}) | {rate:.1f} 청크/s | "
+                        f"경과 {_format_duration(elapsed)} | ETA {_format_duration(remaining)}",
+                        flush=True,
+                    )
         _set_config(connection, model_id)
     return {
         "total": len(catalog), "created": sum(chunk.id not in existing for chunk in changed),

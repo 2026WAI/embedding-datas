@@ -60,7 +60,8 @@ class EmbeddingConfigTests(unittest.TestCase):
                 "model_dir: models/bge\n"
                 "model_id: example/model\n"
                 "batch_size: 8\n"
-                "device: cuda\n",
+                "device: cuda\n"
+                "progress: log\n",
                 encoding="utf-8",
             )
             args = self.arguments(config)
@@ -73,6 +74,7 @@ class EmbeddingConfigTests(unittest.TestCase):
             self.assertEqual(resolved.model_id, "example/model")
             self.assertEqual(resolved.batch_size, 32)
             self.assertEqual(resolved.device, "cuda")
+            self.assertEqual(resolved.progress, "log")
 
     def test_rejects_unknown_config_setting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
