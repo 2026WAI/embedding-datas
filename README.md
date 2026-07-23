@@ -43,6 +43,8 @@ Kaggle에서는 청크가 담긴 Dataset을 Input으로 추가한 뒤 `build_emb
 Output 탭에서 `rag.sqlite3`를 내려받을 수 있습니다.
 Kaggle 노트북은 셀 프리뷰에 맞춰 `--progress log`를 사용하므로, 배치마다 새 줄의
 진행률·처리 속도·경과 시간·ETA가 즉시 출력됩니다.
+GPU가 두 장 이상이면 노트북은 각 GPU에 BGE-M3 임베딩 worker를 하나씩 고정하고,
+메인 프로세스가 SQLite에 순차 기록합니다.
 
 기본 동기화 설정은 `embedding_config.yaml`에 있습니다. `batch_size`, `device`, 모델 및
 경로를 그 파일에서 바꿀 수 있으며, 명령행 옵션을 지정하면 그 값이 우선합니다. 예를 들어

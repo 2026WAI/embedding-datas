@@ -47,6 +47,7 @@ class EmbeddingConfigTests(unittest.TestCase):
             model_id=None,
             batch_size=None,
             device=None,
+            devices=None,
             rebuild=False,
         )
 

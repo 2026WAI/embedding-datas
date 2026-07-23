@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing as mp
+import queue
 import sqlite3
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -305,9 +308,109 @@ def _format_duration(seconds: float) -> str:
     return f"{hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:d}:{seconds:02d}"
 
 
+def _parallel_embedding_worker(
+    worker_index: int,
+    device: str,
+    model_dir: str,
+    batch_size: int,
+    task_queue: Any,
+    result_queue: Any,
+) -> None:
+    """한 GPU에 고정되어 배치 임베딩만 수행하는 자식 프로세스 진입점."""
+    try:
+        embedder = HybridEmbedder(Path(model_dir), device)
+    except BaseException:
+        result_queue.put(("error", worker_index, None, traceback.format_exc()))
+        return
+    while True:
+        task = task_queue.get()
+        if task is None:
+            return
+        task_id, texts = task
+        try:
+            dense, sparse = embedder.encode(texts, batch_size)
+            result_queue.put(("result", worker_index, task_id, dense, sparse))
+        except BaseException:
+            result_queue.put(("error", worker_index, task_id, traceback.format_exc()))
+            return
+
+
+def _parallel_embed_groups(
+    groups: Iterator[Sequence[Chunk]], model_dir: Path, batch_size: int, devices: Sequence[str]
+) -> Iterator[tuple[Sequence[Chunk], Any, list[dict[str, float]]]]:
+    """여러 GPU worker에서 임베딩하고, 완료되는 순서대로 배치 결과를 반환한다.
+
+    DB 쓰기는 이 함수 밖의 부모 프로세스에서만 실행한다. CUDA는 fork 후 초기화하면
+    불안정할 수 있으므로 spawn 프로세스를 사용하고, 각 worker에 하나의 장치를 고정한다.
+    """
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    task_queues = [context.Queue(maxsize=1) for _ in devices]
+    workers = [
+        context.Process(
+            target=_parallel_embedding_worker,
+            args=(index, device, str(model_dir), batch_size, task_queue, result_queue),
+            name=f"bge-m3-{device}",
+        )
+        for index, (device, task_queue) in enumerate(zip(devices, task_queues, strict=True))
+    ]
+    for worker in workers:
+        worker.start()
+
+    next_task_id = 0
+    pending: dict[int, Sequence[Chunk]] = {}
+
+    def submit(worker_index: int) -> bool:
+        nonlocal next_task_id
+        try:
+            group = next(groups)
+        except StopIteration:
+            return False
+        task_queues[worker_index].put((next_task_id, [chunk.text for chunk in group]))
+        pending[next_task_id] = group
+        next_task_id += 1
+        return True
+
+    try:
+        for worker_index in range(len(workers)):
+            submit(worker_index)
+        while pending:
+            try:
+                message = result_queue.get(timeout=1)
+            except queue.Empty:
+                failed = [worker for worker in workers if worker.exitcode not in (None, 0)]
+                if failed:
+                    names = ", ".join(f"{worker.name} (exit {worker.exitcode})" for worker in failed)
+                    raise RuntimeError(f"병렬 임베딩 worker가 비정상 종료했습니다: {names}")
+                continue
+            kind, worker_index, task_id, *payload = message
+            if kind == "error":
+                detail = str(payload[0])
+                raise RuntimeError(f"{devices[worker_index]} 임베딩 worker 오류:\n{detail}")
+            dense, sparse = payload
+            assert task_id is not None
+            yield pending.pop(task_id), dense, sparse
+            submit(worker_index)
+    finally:
+        for task_queue in task_queues:
+            try:
+                task_queue.put_nowait(None)
+            except queue.Full:
+                pass
+        for worker in workers:
+            worker.join(timeout=5)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join()
+
+
 def synchronize(
     connection: sqlite3.Connection, catalog: dict[str, Chunk], model_id: str,
-    model_dir: Path, batch_size: int, device: str | None, progress: str = "tqdm",
+    model_dir: Path,
+    batch_size: int,
+    device: str | None,
+    progress: str = "tqdm",
+    devices: Sequence[str] | None = None,
 ) -> dict[str, int]:
     """현재 JSONL 카탈로그와 생성 DB의 완전 동기화
 
@@ -319,6 +422,7 @@ def synchronize(
         batch_size: 모델 추론 배치 크기
         device: 사용할 PyTorch 장치, 생략 시 라이브러리 기본값 사용
         progress: tqdm 동적 막대 또는 줄 단위 log 진행 출력 방식
+        devices: 병렬 임베딩에 고정할 CUDA 장치 목록. 두 개 이상이면 GPU별 worker를 생성
 
     Returns:
         total, created, updated, deleted, unchanged 수를 담은 사전
@@ -334,6 +438,10 @@ def synchronize(
     """
     if progress not in {"tqdm", "log"}:
         raise ValueError("progress는 tqdm 또는 log여야 합니다.")
+    if devices and device:
+        raise ValueError("device와 devices는 함께 지정할 수 없습니다.")
+    if devices and any(not value for value in devices):
+        raise ValueError("devices에는 비어 있지 않은 장치 이름이 필요합니다.")
     create_schema(connection)
     ensure_store_compatible(connection, model_id)
     existing = {
@@ -349,7 +457,15 @@ def synchronize(
         f"변경사항: 추가 {created:,}, 갱신 {updated:,}, 삭제 {len(removed):,}, "
         f"유지 {unchanged:,} (임베딩 대상 {len(changed):,}개)"
     )
-    embedder = HybridEmbedder(model_dir, device) if changed else None
+    parallel_devices = tuple(devices or ())
+    effective_device = parallel_devices[0] if len(parallel_devices) == 1 else device
+    embedder = HybridEmbedder(model_dir, effective_device) if changed and len(parallel_devices) < 2 else None
+    if changed and len(parallel_devices) >= 2:
+        print(
+            f"병렬 임베딩 시작: {', '.join(parallel_devices)} "
+            f"(GPU별 worker 1개, SQLite 단일 writer)",
+            flush=True,
+        )
 
     # 중간 실패 시 기존 검색 인덱스 보존을 위한 모든 변경의 단일 트랜잭션 처리
     with connection:
@@ -358,11 +474,9 @@ def synchronize(
             connection.execute("DELETE FROM sparse_postings WHERE chunk_rowid = ?", (rowid,))
             connection.execute("DELETE FROM chunks WHERE rowid = ?", (rowid,))
         if changed:
-            def index_group(group: Sequence[Chunk]) -> None:
-                assert embedder is not None
-                dense_embeddings, sparse_embeddings = embedder.encode(
-                    [chunk.text for chunk in group], batch_size
-                )
+            def index_group(
+                group: Sequence[Chunk], dense_embeddings: Any, sparse_embeddings: list[dict[str, float]]
+            ) -> None:
                 for chunk, dense_embedding, sparse_embedding in zip(
                     group, dense_embeddings, sparse_embeddings, strict=True
                 ):
@@ -382,29 +496,45 @@ def synchronize(
                         ((token_id, rowid, weight) for token_id, weight in sparse_embedding.items()),
                     )
 
-            if progress == "tqdm":
-                from tqdm import tqdm
-
-                with tqdm(
-                    total=len(changed), desc="임베딩 진행", unit="청크", dynamic_ncols=True
-                ) as progress_bar:
-                    for group in _batches(changed, batch_size):
-                        index_group(group)
-                        progress_bar.update(len(group))
-            elif progress == "log":
-                started_at, completed = monotonic(), 0
-                for group in _batches(changed, batch_size):
-                    index_group(group)
-                    completed += len(group)
-                    elapsed = monotonic() - started_at
-                    rate = completed / elapsed if elapsed else 0.0
-                    remaining = (len(changed) - completed) / rate if rate else 0.0
-                    print(
-                        f"임베딩 진행: {completed:,}/{len(changed):,} "
-                        f"({completed / len(changed):.1%}) | {rate:.1f} 청크/s | "
-                        f"경과 {_format_duration(elapsed)} | ETA {_format_duration(remaining)}",
-                        flush=True,
+            def encoded_groups() -> Iterator[tuple[Sequence[Chunk], Any, list[dict[str, float]]]]:
+                groups = iter(_batches(changed, batch_size))
+                if len(parallel_devices) >= 2:
+                    yield from _parallel_embed_groups(groups, model_dir, batch_size, parallel_devices)
+                    return
+                assert embedder is not None
+                for group in groups:
+                    dense_embeddings, sparse_embeddings = embedder.encode(
+                        [chunk.text for chunk in group], batch_size
                     )
+                    yield group, dense_embeddings, sparse_embeddings
+
+            encoded = encoded_groups()
+            try:
+                if progress == "tqdm":
+                    from tqdm import tqdm
+
+                    with tqdm(
+                        total=len(changed), desc="임베딩 진행", unit="청크", dynamic_ncols=True
+                    ) as progress_bar:
+                        for group, dense_embeddings, sparse_embeddings in encoded:
+                            index_group(group, dense_embeddings, sparse_embeddings)
+                            progress_bar.update(len(group))
+                else:
+                    started_at, completed = monotonic(), 0
+                    for group, dense_embeddings, sparse_embeddings in encoded:
+                        index_group(group, dense_embeddings, sparse_embeddings)
+                        completed += len(group)
+                        elapsed = monotonic() - started_at
+                        rate = completed / elapsed if elapsed else 0.0
+                        remaining = (len(changed) - completed) / rate if rate else 0.0
+                        print(
+                            f"임베딩 진행: {completed:,}/{len(changed):,} "
+                            f"({completed / len(changed):.1%}) | {rate:.1f} 청크/s | "
+                            f"경과 {_format_duration(elapsed)} | ETA {_format_duration(remaining)}",
+                            flush=True,
+                        )
+            finally:
+                encoded.close()
         _set_config(connection, model_id)
     return {
         "total": len(catalog), "created": sum(chunk.id not in existing for chunk in changed),

@@ -91,6 +91,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, help="BGE-M3 임베딩 배치 크기")
     parser.add_argument("--device", help="예: cpu, cuda, cuda:0. 생략하면 기본 장치 선택")
     parser.add_argument(
+        "--devices",
+        help="쉼표로 구분한 병렬 CUDA 장치. 예: cuda:0,cuda:1 (device와 함께 사용 불가)",
+    )
+    parser.add_argument(
         "--progress",
         choices=("tqdm", "log"),
         help="진행 출력 방식. log는 배치마다 새 줄을 flush해 노트북 로그에 적합",
@@ -128,6 +132,15 @@ def main() -> None:
         raise SystemExit(f"설정 오류: {exc}") from exc
     if args.batch_size < 1:
         raise SystemExit("--batch-size는 1 이상이어야 합니다.")
+    if args.device and args.devices:
+        raise SystemExit("--device와 --devices는 함께 지정할 수 없습니다.")
+    devices = None
+    if args.devices:
+        devices = tuple(value.strip() for value in args.devices.split(",") if value.strip())
+        if not devices:
+            raise SystemExit("--devices에는 하나 이상의 장치 이름이 필요합니다.")
+        if len(set(devices)) != len(devices):
+            raise SystemExit("--devices에 같은 장치를 중복 지정할 수 없습니다.")
     catalog = load_chunks(args.chunk_dir)
     print(f"발견한 청크: {len(catalog):,}개")
     connection = connect_database(args.db_path)
@@ -143,6 +156,7 @@ def main() -> None:
             args.batch_size,
             args.device,
             args.progress,
+            devices,
         )
     finally:
         connection.close()
