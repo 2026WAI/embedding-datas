@@ -31,8 +31,8 @@ RAG 파이프라인에 결과를 전달할 때는 --json을 추가하세요.
 CPU 대신 Colab GPU에서 전체 임베딩을 만들려면 루트의
 `build_embeddings_colab.ipynb`를 Colab에서 열어 위에서 아래 순서대로 실행하세요.
 `chunk.7z`를 업로드하면 구조를 검증하고, 완료된 `rag.sqlite3`를 다운로드합니다.
-Kaggle에서는 `chunk.7z`를 Dataset 입력으로 추가한 뒤
-`build_embeddings_kaggle.ipynb`를 실행하세요. GPU와 Internet을 켜고, 완료 후 Save Version의
+Kaggle에서는 청크가 담긴 Dataset을 Input으로 추가한 뒤 `build_embeddings_kaggle.ipynb`를
+실행하세요. GPU와 Internet을 켜고, 완료 후 Save Version의
 Output 탭에서 `rag.sqlite3`를 내려받을 수 있습니다.
 
 기본 동기화 설정은 `embedding_config.yaml`에 있습니다. `batch_size`, `device`, 모델 및
