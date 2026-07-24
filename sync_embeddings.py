@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,9 @@ DEFAULTS: dict[str, Any] = {
     "batch_size": 16,
     "device": None,
     "progress": "tqdm",
+    "hybrid_dense_candidates": 200,
+    "hybrid_dense_weight": 0.5,
+    "hybrid_sparse_weight": 0.5,
 }
 PATH_SETTINGS = {"chunk_dir", "db_path", "model_dir"}
 
@@ -57,10 +61,19 @@ def load_config(path: Path) -> dict[str, Any]:
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{key}는 비어 있지 않은 경로 문자열이어야 합니다.")
             config[key] = Path(value) if Path(value).is_absolute() else path.parent / value
-        elif key == "batch_size":
+        elif key in {"batch_size", "hybrid_dense_candidates"}:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError("batch_size는 1 이상의 정수여야 합니다.")
+                raise ValueError(f"{key}는 1 이상의 정수여야 합니다.")
             config[key] = value
+        elif key in {"hybrid_dense_weight", "hybrid_sparse_weight"}:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{key}는 0 이상의 숫자여야 합니다.")
+            config[key] = float(value)
         elif key == "device":
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError("device는 문자열 또는 null이어야 합니다.")

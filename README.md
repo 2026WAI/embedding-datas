@@ -4,7 +4,7 @@
 
 - 입력 원본: `chunk/**/chunks.jsonl` — 읽기 전용
 - 임베딩 모델: BAAI BGE-M3 (`dense` + `sparse`)
-- 검색 방식: SQLite 역색인 + sqlite-vec + RRF hybrid fusion
+- 검색 방식: sqlite-vec dense 후보 추출 + 후보 내 sparse 재채점
 - 생성 경로: `.models/`, `vector_store/`
 
 ## 빠른 시작
@@ -40,7 +40,7 @@ python search.py --query "전자금융사기 피해금 환급 절차" --top-k 3
 python search.py --query "전자금융사기 피해금 환급 절차" --top-k 3 --json
 ```
 
-- 기본 모드: `hybrid` — dense + sparse 결과를 RRF로 결합
+- 기본 모드: `hybrid` — dense 후보 200개를 추린 뒤 후보 내 sparse 점수를 가중 결합
 - 비교 모드: `--mode dense`, `--mode sparse`
 - 대화형 종료: `:q`, `quit`, `exit`, `Ctrl-D`, `Ctrl-C`
 - 색상: 자동 적용 · `--color always` · `--color never`
@@ -73,11 +73,12 @@ python search.py --query "전자금융사기 피해금 환급 절차" --top-k 3 
 ## 설정
 
 - 기본 설정 파일: `embedding_config.yaml`
-- 주요 항목: `batch_size`, `device`, 모델 경로, 입출력 경로
-- 우선순위: 명령행 옵션 > 설정 파일
+- 주요 항목: `batch_size`, `device`, 모델 경로, 입출력 경로, `hybrid_dense_candidates`, hybrid 가중치
+- 동기화 옵션 우선순위: 명령행 옵션 > 설정 파일
+- hybrid 후보 수와 가중치는 YAML의 `hybrid_*` 항목에서 조정
 - GPU: `device: cuda`
 - 메모리 부족: `batch_size` 낮추기
-- 다른 설정 파일: `python sync_embeddings.py --config 경로/설정.yaml`
+- 다른 설정 파일: `python sync_embeddings.py --config 경로/설정.yaml`, `python search.py --config 경로/설정.yaml`
 
 ## 동기화
 
@@ -116,7 +117,7 @@ SQLite 테이블
 
 결과 점수
 
-- hybrid JSON: `rrf_score`, `dense_rank`, `sparse_rank`
+- hybrid JSON: `hybrid_score`, `dense_score`, `sparse_score`
 - dense: `similarity`
 - sparse: `sparse_score`
 

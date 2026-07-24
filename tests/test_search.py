@@ -24,11 +24,14 @@ class SearchOutputTests(unittest.TestCase):
     def test_plain_output_separates_query_result_and_body(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
-            print_results([self.result()], 1000, False, query="인사 함수", color="never")
+            print_results(
+                [self.result()], 1000, False, query="인사 함수", color="never", elapsed_seconds=0.09
+            )
 
         rendered = output.getvalue()
         self.assertIn("============ 검색 질의 ============", rendered)
         self.assertIn("============ 검색 결과 ============", rendered)
+        self.assertIn("검색 소요 시간 (0.09s)", rendered)
         self.assertIn("------------ 본문 ------------", rendered)
         self.assertIn("```python", rendered)
         self.assertNotIn(ANSI_RESET, rendered)

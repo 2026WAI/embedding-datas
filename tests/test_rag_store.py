@@ -6,8 +6,9 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
-from rag_store import load_chunks, search, search_sparse
+from rag_store import load_chunks, search, search_hybrid, search_sparse
 from sync_embeddings import resolve_args
 
 
@@ -76,6 +77,7 @@ class EmbeddingConfigTests(unittest.TestCase):
             self.assertEqual(resolved.batch_size, 32)
             self.assertEqual(resolved.device, "cuda")
             self.assertEqual(resolved.progress, "log")
+            self.assertEqual(resolved.hybrid_dense_candidates, 200)
 
     def test_rejects_unknown_config_setting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -123,6 +125,30 @@ class SparseInvertedIndexTests(unittest.TestCase):
         self.assertEqual([result["id"] for result in results], ["a", "b", "c"])
         self.assertAlmostEqual(float(results[0]["sparse_score"]), 0.5)
         self.assertAlmostEqual(float(results[1]["sparse_score"]), 0.45)
+
+    def test_sparse_search_restricts_scoring_to_dense_candidates(self) -> None:
+        results = search_sparse(self.connection, {"10": 0.5, "20": 0.5}, 3, candidate_ids=["b", "c"])
+
+        self.assertEqual([result["id"] for result in results], ["b", "c"])
+
+    def test_hybrid_reranks_only_dense_candidates_with_weighted_scores(self) -> None:
+        dense_results = [
+            {"id": "b", "text": "둘째 청크", "metadata": {}, "dense_score": 0.5},
+            {"id": "c", "text": "셋째 청크", "metadata": {}, "dense_score": 0.9},
+        ]
+        with patch("rag_store.search_dense", return_value=dense_results):
+            results = search_hybrid(
+                self.connection,
+                None,
+                {"10": 1.0},
+                2,
+                dense_candidates=2,
+                dense_weight=0.2,
+                sparse_weight=0.8,
+            )
+
+        self.assertEqual([result["id"] for result in results], ["b", "c"])
+        self.assertAlmostEqual(float(results[0]["hybrid_score"]), 0.8)
 
     def test_search_dispatches_sparse_mode(self) -> None:
         results = search(self.connection, None, {"20": 1.0}, 2, mode="sparse")

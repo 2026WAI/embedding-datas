@@ -20,6 +20,9 @@ STORE_FORMAT = "bge-m3-hybrid-v1"
 DEFAULT_CHUNK_DIR = Path("chunk")
 DEFAULT_DB_PATH = Path("vector_store/rag.sqlite3")
 DEFAULT_MODEL_DIR = Path(".models/bge-m3")
+DEFAULT_HYBRID_DENSE_CANDIDATES = 200
+DEFAULT_HYBRID_DENSE_WEIGHT = 0.5
+DEFAULT_HYBRID_SPARSE_WEIGHT = 0.5
 
 
 @dataclass(frozen=True)
@@ -598,12 +601,16 @@ def search_dense(connection: sqlite3.Connection, query_embedding: Any, top_k: in
 
 
 def search_sparse(
-    connection: sqlite3.Connection, query_weights: dict[str, float], top_k: int
+    connection: sqlite3.Connection,
+    query_weights: dict[str, float],
+    top_k: int,
+    candidate_ids: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """BGE-M3 lexical weight의 내적으로 SQLite 역색인을 검색한다.
 
     질의 token_id와 청크 posting을 조인해 `sum(query_weight * document_weight)`를
-    계산한다. 임시 테이블은 연결별로 격리되어 동시 검색 간에 공유되지 않는다.
+    계산한다. 후보 ID가 주어지면 해당 청크에 한해서만 계산한다. 임시 테이블은
+    연결별로 격리되어 동시 검색 간에 공유되지 않는다.
     """
     if top_k < 1:
         raise ValueError("top_k는 1 이상이어야 합니다.")
@@ -617,15 +624,42 @@ def search_sparse(
     connection.executemany(
         "INSERT INTO query_sparse_terms(token_id, weight) VALUES (?, ?)", query_weights.items()
     )
-    rows = connection.execute(
+    if candidate_ids is not None:
+        if not candidate_ids:
+            return []
+        connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS query_dense_candidates "
+            "(chunk_rowid INTEGER PRIMARY KEY) WITHOUT ROWID"
+        )
+        connection.execute("DELETE FROM query_dense_candidates")
+        connection.executemany(
+            "INSERT INTO query_dense_candidates(chunk_rowid) "
+            "SELECT rowid FROM chunks WHERE id = ?",
+            ((candidate_id,) for candidate_id in candidate_ids),
+        )
+        sparse_scores_sql = """
+            SELECT postings.chunk_rowid, SUM(postings.weight * query_terms.weight) AS score
+            FROM query_dense_candidates AS candidates
+            CROSS JOIN sparse_postings AS postings
+            JOIN query_sparse_terms AS query_terms ON query_terms.token_id = postings.token_id
+            WHERE postings.chunk_rowid = candidates.chunk_rowid
+            GROUP BY postings.chunk_rowid
+            ORDER BY score DESC, postings.chunk_rowid ASC
+            LIMIT ?
         """
-        WITH sparse_scores AS (
+    else:
+        sparse_scores_sql = """
             SELECT postings.chunk_rowid, SUM(postings.weight * query_terms.weight) AS score
             FROM query_sparse_terms AS query_terms
             JOIN sparse_postings AS postings USING (token_id)
             GROUP BY postings.chunk_rowid
             ORDER BY score DESC, postings.chunk_rowid ASC
             LIMIT ?
+        """
+    rows = connection.execute(
+        f"""
+        WITH sparse_scores AS (
+            {sparse_scores_sql}
         )
         SELECT chunks.id, chunks.text, chunks.metadata_json, sparse_scores.score
         FROM sparse_scores JOIN chunks ON chunks.rowid = sparse_scores.chunk_rowid
@@ -636,32 +670,49 @@ def search_sparse(
     return [_result(row, sparse_score=float(row["score"])) for row in rows]
 
 
+def _min_max_normalized(results: Sequence[dict[str, Any]], key: str) -> dict[str, float]:
+    """결합 가능한 0~1 점수로 변환한다. sparse 미일치 문서는 0점으로 둔다."""
+    values = {str(result["id"]): float(result.get(key, 0.0)) for result in results}
+    if not values:
+        return {}
+    lower, upper = min(values.values()), max(values.values())
+    if upper == lower:
+        return {chunk_id: 1.0 if score else 0.0 for chunk_id, score in values.items()}
+    return {chunk_id: (score - lower) / (upper - lower) for chunk_id, score in values.items()}
+
+
 def search_hybrid(
     connection: sqlite3.Connection,
     query_embedding: Any,
     query_weights: dict[str, float],
     top_k: int,
-    rrf_k: int = 60,
+    dense_candidates: int = DEFAULT_HYBRID_DENSE_CANDIDATES,
+    dense_weight: float = DEFAULT_HYBRID_DENSE_WEIGHT,
+    sparse_weight: float = DEFAULT_HYBRID_SPARSE_WEIGHT,
 ) -> list[dict[str, Any]]:
-    """dense와 sparse 후보를 RRF(Reciprocal Rank Fusion)로 합친다."""
+    """dense 후보만 sparse 재채점하고 정규화된 점수를 가중 결합한다."""
     if top_k < 1:
         raise ValueError("top_k는 1 이상이어야 합니다.")
-    candidate_k = max(50, top_k * 5)
-    dense_results = search_dense(connection, query_embedding, candidate_k)
-    sparse_results = search_sparse(connection, query_weights, candidate_k)
-    merged: dict[str, dict[str, Any]] = {}
-    for rank, result in enumerate(dense_results, 1):
-        fused = merged.setdefault(result["id"], dict(result))
-        fused["dense_rank"] = rank
-        fused["rrf_score"] = float(fused.get("rrf_score", 0.0)) + 1.0 / (rrf_k + rank)
-    for rank, result in enumerate(sparse_results, 1):
-        fused = merged.setdefault(result["id"], dict(result))
-        fused["sparse_rank"] = rank
-        fused["sparse_score"] = result["sparse_score"]
-        fused["rrf_score"] = float(fused.get("rrf_score", 0.0)) + 1.0 / (rrf_k + rank)
-    return sorted(
-        merged.values(), key=lambda item: (-float(item["rrf_score"]), str(item["id"]))
-    )[:top_k]
+    if dense_candidates < top_k:
+        raise ValueError("dense_candidates는 top_k 이상이어야 합니다.")
+    if dense_weight < 0 or sparse_weight < 0 or dense_weight + sparse_weight == 0:
+        raise ValueError("dense_weight와 sparse_weight의 합은 양수여야 합니다.")
+
+    dense_results = search_dense(connection, query_embedding, dense_candidates)
+    sparse_results = search_sparse(
+        connection, query_weights, dense_candidates, [str(result["id"]) for result in dense_results]
+    )
+    sparse_scores = {str(result["id"]): float(result["sparse_score"]) for result in sparse_results}
+    candidates = [dict(result, sparse_score=sparse_scores.get(str(result["id"]), 0.0)) for result in dense_results]
+    dense_normalized = _min_max_normalized(candidates, "dense_score")
+    sparse_normalized = _min_max_normalized(candidates, "sparse_score")
+    total_weight = dense_weight + sparse_weight
+    for result in candidates:
+        chunk_id = str(result["id"])
+        result["hybrid_score"] = (
+            dense_weight * dense_normalized[chunk_id] + sparse_weight * sparse_normalized[chunk_id]
+        ) / total_weight
+    return sorted(candidates, key=lambda item: (-float(item["hybrid_score"]), str(item["id"])))[:top_k]
 
 
 def search(
@@ -670,6 +721,9 @@ def search(
     query_weights: dict[str, float],
     top_k: int,
     mode: str = "hybrid",
+    dense_candidates: int = DEFAULT_HYBRID_DENSE_CANDIDATES,
+    dense_weight: float = DEFAULT_HYBRID_DENSE_WEIGHT,
+    sparse_weight: float = DEFAULT_HYBRID_SPARSE_WEIGHT,
 ) -> list[dict[str, Any]]:
     """지정한 dense, sparse 또는 hybrid 방식으로 청크를 검색한다.
 
@@ -679,6 +733,9 @@ def search(
         query_weights: BGE-M3 sparse lexical weight
         top_k: 반환할 최근접 청크 수
         mode: dense, sparse 또는 hybrid
+        dense_candidates: hybrid가 sparse 재채점할 dense 후보 수
+        dense_weight: 정규화 dense 점수의 hybrid 가중치
+        sparse_weight: 정규화 sparse 점수의 hybrid 가중치
 
     Returns:
         id, text, metadata 및 검색 모드별 점수를 포함한 결과 목록
@@ -691,5 +748,7 @@ def search(
     if mode == "sparse":
         return search_sparse(connection, query_weights, top_k)
     if mode == "hybrid":
-        return search_hybrid(connection, query_embedding, query_weights, top_k)
+        return search_hybrid(
+            connection, query_embedding, query_weights, top_k, dense_candidates, dense_weight, sparse_weight
+        )
     raise ValueError("mode는 dense, sparse 또는 hybrid여야 합니다.")

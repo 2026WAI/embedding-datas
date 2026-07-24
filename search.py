@@ -9,6 +9,7 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 try:
@@ -28,6 +29,7 @@ from rag_store import (
     ensure_searchable,
     search,
 )
+from sync_embeddings import DEFAULT_CONFIG_PATH, DEFAULTS, load_config
 
 
 ANSI_RESET = "\033[0m"
@@ -54,9 +56,10 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=("hybrid", "dense", "sparse"),
         default="hybrid",
-        help="검색 방식 (기본: hybrid; dense와 sparse를 RRF로 결합)",
+        help="검색 방식 (기본: hybrid; dense 후보를 sparse로 재채점해 가중 결합)",
     )
     parser.add_argument("--query", help="한 번만 검색하고 종료")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="검색 설정 YAML 파일")
     parser.add_argument("--json", action="store_true", help="결과를 JSON으로 출력")
     parser.add_argument(
         "--color",
@@ -145,6 +148,7 @@ def print_results(
     as_json: bool,
     query: str | None = None,
     color: str = "auto",
+    elapsed_seconds: float | None = None,
 ) -> None:
     """검색 결과의 일반 텍스트 또는 JSON 출력
 
@@ -154,6 +158,7 @@ def print_results(
         as_json: JSON 배열 전체 출력 여부
         query: 일반 텍스트 출력에 표시할 검색 질의
         color: 색상 출력 방식
+        elapsed_seconds: 질의 임베딩과 검색에 걸린 시간(초)
     """
     if as_json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -162,6 +167,8 @@ def print_results(
     if query is not None:
         print(_rule("검색 질의", "=", use_color))
         print(_styled(query, ANSI_BOLD, ANSI_CYAN, enabled=use_color))
+        if elapsed_seconds is not None:
+            print(f"검색 소요 시간 ({elapsed_seconds:.2f}s)")
         print(_rule("검색 결과", "=", use_color))
     if not results:
         print("검색 결과가 없습니다.")
@@ -170,8 +177,8 @@ def print_results(
         metadata = result["metadata"]
         print()
         score = (
-            f"rrf={result['rrf_score']:.4f}"
-            if "rrf_score" in result
+            f"hybrid={result['hybrid_score']:.4f}"
+            if "hybrid_score" in result
             else f"sparse={result['sparse_score']:.4f}"
             if "sparse_score" in result and "similarity" not in result
             else f"similarity={result['similarity']:.4f}"
@@ -199,6 +206,9 @@ def run_query(
     query: str,
     top_k: int,
     mode: str,
+    dense_candidates: int,
+    dense_weight: float,
+    sparse_weight: float,
 ) -> list[dict[str, Any]]:
     """질의의 dense/sparse 임베딩 생성 및 지정 검색 실행
 
@@ -213,7 +223,32 @@ def run_query(
         유사도 순 정렬 검색 결과 목록
     """
     dense_embeddings, sparse_embeddings = embedder.encode([query], 1)
-    return search(connection, dense_embeddings[0], sparse_embeddings[0], top_k, mode)
+    return search(
+        connection,
+        dense_embeddings[0],
+        sparse_embeddings[0],
+        top_k,
+        mode,
+        dense_candidates,
+        dense_weight,
+        sparse_weight,
+    )
+
+
+def load_search_settings(config_path: Path) -> tuple[int, float, float]:
+    """YAML에서 hybrid 후보 수와 가중치를 읽어 검색에 적용한다."""
+    if config_path.exists():
+        config = load_config(config_path)
+    elif config_path != DEFAULT_CONFIG_PATH:
+        raise ValueError(f"설정 파일이 없습니다: {config_path}")
+    else:
+        config = {}
+    dense_candidates = int(config.get("hybrid_dense_candidates", DEFAULTS["hybrid_dense_candidates"]))
+    dense_weight = float(config.get("hybrid_dense_weight", DEFAULTS["hybrid_dense_weight"]))
+    sparse_weight = float(config.get("hybrid_sparse_weight", DEFAULTS["hybrid_sparse_weight"]))
+    if dense_weight + sparse_weight == 0:
+        raise ValueError("hybrid_dense_weight와 hybrid_sparse_weight의 합은 양수여야 합니다.")
+    return dense_candidates, dense_weight, sparse_weight
 
 
 def main() -> None:
@@ -225,17 +260,29 @@ def main() -> None:
     args = parse_args()
     if args.top_k < 1 or args.max_text_chars < 0:
         raise SystemExit("--top-k는 1 이상, --max-text-chars는 0 이상이어야 합니다.")
+    try:
+        dense_candidates, dense_weight, sparse_weight = load_search_settings(args.config)
+    except ValueError as exc:
+        raise SystemExit(f"설정 오류: {exc}") from exc
+    if args.mode == "hybrid" and dense_candidates < args.top_k:
+        raise SystemExit("hybrid_dense_candidates는 --top-k 이상이어야 합니다.")
     connection = connect_database(args.db_path)
     try:
         ensure_searchable(connection, args.model_id)
         embedder = HybridEmbedder(args.model_dir, args.device)
         if args.query is not None:
+            started_at = perf_counter()
+            results = run_query(
+                embedder, connection, args.query, args.top_k, args.mode,
+                dense_candidates, dense_weight, sparse_weight,
+            )
             print_results(
-                run_query(embedder, connection, args.query, args.top_k, args.mode),
+                results,
                 args.max_text_chars,
                 args.json,
                 query=args.query,
                 color=args.color,
+                elapsed_seconds=perf_counter() - started_at,
             )
             return
         print("로컬 검색을 시작합니다. 종료: :q, quit, exit")
@@ -248,12 +295,18 @@ def main() -> None:
             if query.lower() in {":q", "quit", "exit"}:
                 break
             if query:
+                started_at = perf_counter()
+                results = run_query(
+                    embedder, connection, query, args.top_k, args.mode,
+                    dense_candidates, dense_weight, sparse_weight,
+                )
                 print_results(
-                    run_query(embedder, connection, query, args.top_k, args.mode),
+                    results,
                     args.max_text_chars,
                     args.json,
                     query=query,
                     color=args.color,
+                    elapsed_seconds=perf_counter() - started_at,
                 )
     finally:
         connection.close()
